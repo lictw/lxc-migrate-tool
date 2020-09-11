@@ -1,0 +1,488 @@
+#!/bin/bash -e
+
+# Constants:
+DEPLOY_SCRIPT_FILE="deploy.sh" # Name of the deploy-wrapper on this script
+CONTAINERS_DIRECTORY="containers" # The name of the directory to place container's data
+
+TIMESTAMP="$(date '+%Y-%m-%d')"
+DIRECTORY="$(dirname "$0")" # The directory to find the data in deploy mode
+DESTINATION="./" # Default destination in dump mode
+ARCHIVE_NAME="${TIMESTAMP}.$(hostname).lxd-data.tar.gz" # Default archive name in dump mode
+DEPLOY_SCRIPT_ARGUMENTS="--deploy --exec"
+
+CONFIG_EXCLUDES=("image" "volatile")
+
+# Flags:
+FULL="FALSE" # Dump/deploy container's configuration
+DEPLOY="FALSE"
+EXECUTION="FALSE"
+
+CLEAN="TRUE" # Remove some intermediate things
+DEBUG="FALSE" # Not disables/enables EXECUTION! Just suppresses the destructive commands and enables printing of useful debug information
+REPLACE="FALSE"
+SAVE_CONFIG="FALSE"
+DEPLOY_SCRIPT="TRUE"
+COMMANDS_PRINTING="TRUE"
+
+function USAGE {
+    test "$1" && CODE="$1" || CODE="0"
+    echo "$0 [--deploy|--full|--exec|--debug|--no-clean|--no-commands|--no-deploy-script|--exclude CONTAINER] [CONTAINERS] [DESTINATION]"
+    echo "  SOURCE for deploy mode is $DIRECTORY"
+    echo "  Default DESTINATION is ${DESTINATION}${ARCHIVE_NAME}"
+    echo "  All found containers will be processed, by default"
+    exit "$CODE"
+}
+
+# Prints the message with prefix, if debug mode is enabled:
+function DEBUG {
+    if [[ "$DEBUG" == "TRUE" ]]; then
+        echo "DEBUG: $@"
+    fi
+}
+
+# The same as the DEBUG function, but also with container prefix, it's called only from the containers loop:
+function CONTAINER_DEBUG {
+    DEBUG "container '$CONTAINER': $@"
+}
+
+# Prints the error message and exits with non-zero exit code after that:
+function ERROR {
+    echo "ERROR: $@"
+    exit 100
+}
+
+# The same as the CONTAINER_DEBUG function, but it's builded on top of the ERROR function:
+function CONTAINER_ERROR {
+    ERROR "container '$CONTAINER': $@"
+}
+
+# Prints the command with timestamp and executes it after that, but only if appropriate flags are enabled:
+function EXECUTE {
+    local COMMAND="$1"
+    if [[ "$2" ]]; then
+        local NOTIFICATION="# $2 "
+    fi
+    if [[ "$COMMANDS_PRINTING" == "TRUE" ]]; then
+        echo "($(date '+%Y-%m-%d %H:%M:%S.%N')) ${NOTIFICATION}$ ${COMMAND}"
+    fi
+    # It's necessary to execute the cd command always in deploy mode, becouse the script looks for some files by relative pathes:
+    if [[ "$EXECUTION" == "TRUE" || ("$DEPLOY" == "TRUE" && "$COMMAND" =~ ^"cd ") ]]; then
+        eval "$COMMAND"
+    fi
+}
+
+# Executes the command only when debugging isn't enabled:
+function EXECUTE_NOT_DEBUG {
+    local COMMAND="$1"
+    local EXECUTION_PREVIOUS="$EXECUTION"
+    if [[ "$DEBUG" == "TRUE" ]]; then
+        EXECUTION="FALSE"
+        local NOTIFICATION="Execution suppressed by DEBUG mode"
+    fi
+    EXECUTE "$COMMAND" "$NOTIFICATION"
+    EXECUTION="$EXECUTION_PREVIOUS"
+}
+
+# Executes the command only when cleaning is enabled:
+function EXECUTE_CLEAN {
+    local COMMAND="$1"
+    if [[ "$CLEAN" == "TRUE" ]]; then
+        EXECUTE_NOT_DEBUG "$COMMAND"
+    else
+        local EXECUTION_PREVIOUS="$EXECUTION"
+        EXECUTION="FALSE"
+        EXECUTE "$COMMAND" "Execution suppressed by disabled cleaning"
+        EXECUTION="$EXECUTION_PREVIOUS"
+    fi
+}
+
+function EXCLUDE_CONFIG {
+    local OPTION="$1"
+    for EXCLUDE in ${CONFIG_EXCLUDES[@]}; do
+        if [[ "$OPTION" =~ "$EXCLUDE" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Executes the command for every container, the command must have the placeholder:
+function EXECUTE_CONTAINERS {
+    for CONTAINER in ${CONTAINERS[@]}; do
+        SET_CONTAINER_VARIABLES
+        EXECUTE_NOT_DEBUG "$(echo "$@" | sed "s/{}/$CONTAINER_NAME/")"
+    done
+}
+
+function SORT_CONTAINERS {
+    DEBUG "${FUNCNAME[0]}, CONTAINERS = '${CONTAINERS[@]}'"
+    CONTAINERS=($(echo "${CONTAINERS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+    DEBUG "CONTAINERS = '${CONTAINERS[@]}'"
+}
+
+# Excludes the EXCLUDE array entries from the CONTAINERS array:
+function EXCLUDE_FROM_CONTAINERS {
+    DEBUG "${FUNCNAME[0]}, EXCLUDES = '${EXCLUDES[@]}', CONTAINERS = '${CONTAINERS[@]}'"
+    if (( ${#EXCLUDES[@]} > 0 )); then
+        for EXCLUDE in ${EXCLUDES[@]}; do
+            DEBUG "exclude '$EXCLUDE'"
+            for i in "${!CONTAINERS[@]}"; do
+                if [[ "${CONTAINERS[i]}" == "$EXCLUDE" ]]; then
+                    unset 'CONTAINERS[i]'
+                fi
+            done
+        done
+    fi
+    DEBUG "CONTAINERS = '${CONTAINERS[@]}'"
+}
+
+# Returns the property of the container's device, it's called only from the devices loop inside the containers loop:
+function GET_DEVICE_PROPERTY {
+    echo "$(lxc config device get $CONTAINER $DEVICE $1)"
+}
+
+# This is the common names for dump and deploy modes:
+function SET_CONTAINER_VARIABLES {
+
+    local REPLACED="$CONTAINER"
+    if [[ "$REPLACE" == "TRUE" ]]; then
+        local REPLACED="$(echo "$CONTAINER" | sed -E "$REPLACE_PATTERN")"
+    fi
+
+    if [[ "$DEPLOY" == "TRUE" ]]; then
+        CONTAINER_NAME="$REPLACED"
+        CONTAINER_DUMP="$CONTAINER"
+    else
+        CONTAINER_NAME="$CONTAINER"
+        CONTAINER_DUMP="$REPLACED"
+    fi
+
+    IMAGE_FILE="${CONTAINER_DUMP}/image.tar.gz"
+    IMAGE_NAME="${CONTAINER_NAME}.${TIMESTAMP}"
+    CONFIG_FILE="${CONTAINER_DUMP}/config"
+    CONFIG_ORIGINAL="${CONTAINER_DUMP}/config.original"
+    NIC_DEVICES="${CONTAINER_DUMP}/nic.devices"
+    DISK_DEVICES="${CONTAINER_DUMP}/disk.devices"
+    DATA_DIRECTORY="${CONTAINER_DUMP}/data"
+}
+
+# Command-line arguments parsing:
+while (( $# > 0 )); do
+    DEBUG "current argument is '$1', next is '$2'"
+    case "$1" in
+        "-h"|"--help")
+            USAGE
+            ;;
+        "--deploy")
+            DEPLOY="TRUE"
+            ;;
+        "--full")
+            FULL="TRUE"
+            ;;
+        "--exec")
+            EXECUTION="TRUE"
+            ;;
+        "--disable-execution")
+            EXECUTION="FALSE"
+            ;;
+        "--debug")
+            DEBUG="TRUE"
+            ;;
+        "--no-clean")
+            CLEAN="FALSE"
+            ;;
+        "--no-commands")
+            COMMANDS_PRINTING="FALSE"
+            ;;
+        "--save-config")
+            SAVE_CONFIG="TRUE"
+            ;;
+        "--no-deploy-script")
+            DEPLOY_SCRIPT="FALSE"
+            ;;
+        "--exclude")
+            if [[ "$2" =~ ^-- ]]; then
+                USAGE 100
+            fi
+            DEBUG "exclude"
+            EXCLUDES+=("$2")
+            shift
+            ;;
+        "--exclude-data")
+            if [[ "$2" =~ ^-- ]]; then
+                USAGE 100
+            fi
+            DEBUG "exclude-data"
+            EXCLUDE_DISKS+=("$2")
+            shift
+            ;;
+        "--exclude-config")
+            if [[ "$2" =~ ^-- ]]; then
+                USAGE 100
+            fi
+            DEBUG "exclude-config"
+            CONFIG_EXCLUDES+=("$2")
+            shift
+            ;;
+        "--replace")
+            REPLACE="TRUE"
+            REPLACE_PATTERN="$2"
+            DEBUG "replace mode is enabled, pattern = '$REPLACE_PATTERN'"
+            shift
+            ;;
+        *)
+            # Error on undefined flag:
+            if [[ "$1" =~ ^"--" ]]; then
+                ERROR "unknown option '$1'"
+                USAGE 100
+            fi
+            for ITEM in "${@:2}"; do
+                if [[ "$ITEM" =~ ^"--" ]]; then
+                    ERROR "all flags should be before other options"
+                    USAGE 100
+                fi
+            done
+            # If mode is deploy, all the non-flag arguments should be a container names to deploy:
+            if [[ "$DEPLOY" == "TRUE" ]]; then
+                DEBUG "container"
+                CONTAINERS+=("$1")
+            else
+                # If container is found - it's the name of container, if not and it's the last argument - it's the destination, if not again - it's the error
+                if lxc list --columns n --format csv | grep "$1" > /dev/null; then
+                    DEBUG "container"
+                    if (( $# == 1)); then
+                        for CONTAINER in "${CONTAINERS[@]}"; do
+                            if [[ "$CONTAINER" == "$1" ]]; then
+                                DESTINATION="$1"
+                            fi
+                        done
+                    fi
+                    CONTAINERS+=("$1")
+                else
+                    if (( $# > 1)); then
+                        ERROR "container '$1' not found"
+                    else
+                        DESTINATION="$1"
+                    fi
+                fi
+            fi
+            ;;
+    esac; shift
+done
+
+START_DIRECTORY="$(pwd)"
+SCRIPT_NAME="$(basename "$0")"
+DEBUG "DESTINATION = '$DESTINATION'"
+
+if [[ "$DEPLOY" == "TRUE" ]]; then
+    EXECUTE "cd ${DIRECTORY}/${CONTAINERS_DIRECTORY}"
+    # If no containers from the input, then deploy all containers:
+    if (( ${#CONTAINERS[@]} == 0 )); then
+        CONTAINERS=($(ls))
+    fi
+    CONTAINERS=($(echo "${CONTAINERS[@]}" | sort -u))
+    EXCLUDE_FROM_CONTAINERS
+    # Stop all containers before any changes in their data, container can not be exist:
+    EXECUTE_CONTAINERS "lxc stop {} 2> /dev/null || true"
+    for CONTAINER in ${CONTAINERS[@]}; do
+        CONTAINER_DEBUG "start"
+        SET_CONTAINER_VARIABLES
+        if [[ "$FULL" == "TRUE" ]]; then
+            test -f "$IMAGE_FILE" || CONTAINER_ERROR "image '$IMAGE_FILE' not found"
+            if [[ "$SAVE_CONFIG" == "TRUE" ]]; then
+                lxc config show "$CONTAINER_NAME" | grep -E '(boot|limits|security)\.' | tr -d '":' | sed 's/^..//' > "$CONFIG_ORIGINAL"
+            fi
+            EXECUTE_NOT_DEBUG "lxc rm $CONTAINER_NAME 2> /dev/null || true"
+            EXECUTE_NOT_DEBUG "lxc image import $IMAGE_FILE --alias $IMAGE_NAME > /dev/null"
+            EXECUTE_NOT_DEBUG "lxc init $IMAGE_NAME $CONTAINER_NAME > /dev/null"
+            EXECUTE_CLEAN "lxc image delete $IMAGE_NAME"
+            CONTAINER_DEBUG "restore original config"
+            if [[ "$SAVE_CONFIG" == "TRUE" ]]; then
+                cat "$CONFIG_ORIGINAL" | while read LINE; do
+                    EXECUTE_NOT_DEBUG "lxc config set $CONTAINER_NAME $LINE"
+                done
+            fi
+            CONTAINER_DEBUG "check config file"
+            # The structure of the config file:
+            # <KEY> <VALUE>
+            # The synax of the 'lxc config set' command - lxc config set <CONTAINER> <KEY> <VALUE>
+            # So, it's needed just to appends the command above with line from the config file, line by line:
+            if [[ -f "$CONFIG_FILE" ]]; then
+                cat "$CONFIG_FILE" | while read LINE; do
+                    CONTAINER_DEBUG "config file: LINE = '$LINE'"
+                    if EXCLUDE_CONFIG "$LINE"; then
+                        continue
+                    fi
+                    EXECUTE_NOT_DEBUG "lxc config set $CONTAINER_NAME $LINE"
+                done
+            fi
+            # The sctructure of the nic devices file (network interfaces):
+            # <NAME of the device>
+            # <TYPE of the device>
+            # <PARRENT bridge>
+            # <ADDRESS or UNDEFINED, if address is dynamic>
+            if [[ -f "$NIC_DEVICES" ]]; then
+                cat "$NIC_DEVICES" | while read DEVICE; do
+                    read NICTYPE
+                    read PARENT
+                    read ADDRESS
+                    if [[ "$ADDRESS" == "UNDEFINED" ]]; then
+                        unset ADDRESS
+                    else
+                        ADDRESS=" ipv4.address=$ADDRESS"
+                    fi
+                    EXECUTE_NOT_DEBUG "lxc config device add $CONTAINER_NAME $DEVICE nic nictype=$NICTYPE parent=${PARENT}${ADDRESS} > /dev/null"
+                done
+            fi
+        fi
+        # The sctructure of the disk devices file (internal mounts):
+        # <NAME of the device>
+        # <PATH>
+        # <SOURCE>
+        # And the data of the device is stored in the directory with same name as device in the data directory of the container:
+        if [[ -f "$DISK_DEVICES" ]]; then
+            cat "$DISK_DEVICES" | while read DEVICE; do
+                read TARGET
+                read SOURCE
+                if [[ "$REPLACE" == "TRUE" ]]; then
+                    SOURCE="$(echo "$SOURCE" | sed -E "$REPLACE_PATTERN")"
+                fi
+                if [[ ! -d "$SOURCE" ]]; then
+                    EXECUTE_NOT_DEBUG "mkdir -p $SOURCE"
+                fi
+                if [[ "$FULL" == "TRUE" ]]; then
+                    EXECUTE_NOT_DEBUG "lxc config device add $CONTAINER_NAME $DEVICE disk path=$TARGET source=$SOURCE > /dev/null"
+                fi
+                for EXCLUDE in ${EXCLUDE_DISKS[@]}; do
+                    if echo "$DEVICE" | grep -q -- "$EXCLUDE"; then
+                        continue 2
+                    fi
+                done
+                if [[ -f "${DATA_DIRECTORY}/${DEVICE}.tar.gz" ]]; then
+                    if [[ "$(ls -a "$SOURCE" | wc -l)" != "2" ]]; then
+                        EXECUTE_NOT_DEBUG "rm -rf $SOURCE"
+                        EXECUTE_NOT_DEBUG "mkdir -p $SOURCE"
+                    fi
+                    EXECUTE_NOT_DEBUG "tar -xzp -f ${DATA_DIRECTORY}/${DEVICE}.tar.gz -C $SOURCE"
+                fi
+            done
+        fi
+    done
+    EXECUTE_CONTAINERS "lxc start {} > /dev/null"
+    EXECUTE "cd $START_DIRECTORY"
+else
+    # If no containers from the input, then dump all containers:
+    if (( ${#CONTAINERS[@]} == 0 )); then
+        CONTAINERS=($(lxc list --columns n --format csv))
+    fi
+    SORT_CONTAINERS
+    EXCLUDE_FROM_CONTAINERS
+    # Name of the temporary directory to dump data, it will be archived at the end:
+    DIRECTORY="${START_DIRECTORY}/$(echo "$SCRIPT_NAME" | sed -E 's/\.sh$//').${TIMESTAMP}"
+    test -d "$DIRECTORY" && EXECUTE "rm -rf $DIRECTORY"
+    EXECUTE "mkdir -p ${DIRECTORY}/${CONTAINERS_DIRECTORY}"
+    EXECUTE "cd ${DIRECTORY}/${CONTAINERS_DIRECTORY}"
+    EXECUTE_CONTAINERS "lxc stop {} 2> /dev/null || true"
+    for CONTAINER in ${CONTAINERS[@]}; do
+        SET_CONTAINER_VARIABLES
+        DEVICES="$(lxc config device list "$CONTAINER_NAME")"
+        # Just go to next container, if dump isn't full and the container doesn't have any device:
+        test "$FULL" == "TRUE" || test "$DEVICES" || continue
+        EXECUTE "mkdir -p $DATA_DIRECTORY"
+        if [[ "$FULL" == "TRUE" ]]; then
+            EXECUTE_NOT_DEBUG "lxc publish $CONTAINER_NAME --alias $IMAGE_NAME > /dev/null"
+            EXECUTE_NOT_DEBUG "lxc image export $IMAGE_NAME $(echo "$IMAGE_FILE" | sed -E 's/\.tar\.gz$//') > /dev/null"
+            EXECUTE_CLEAN "lxc image delete $IMAGE_NAME"
+            # See comments in deploy section for structure of the config file:
+            lxc config show $CONTAINER_NAME | sed -n '/config/,/devices/p' | sed '/config/d' | sed '/devices/d' | tr -d '\":' | cut -c 3- | while read LINE; do
+                if EXCLUDE_CONFIG "$LINE"; then
+                    continue
+                fi
+                KEY="$(echo "$LINE" | awk '{print $1}')"
+                VALUE="$(echo "$LINE" | awk '{print $2}')"
+                if ! [[ "$VALUE" ]]; then
+                    CONTAINER_ERROR "value is empty for KEY = '$KEY'"
+                fi
+                EXECUTE "echo '$KEY $VALUE' >> $CONFIG_FILE"
+            done
+            # EXECUTE "lxc config show $CONTAINER | grep -E '(boot|limits|security)\.' | tr -d '\":' | cut -c 3- > $CONFIG_FILE"
+            # See comments in deploy section for structure of the nic devices file:
+            for DEVICE in $DEVICES; do
+                if [[ "$(GET_DEVICE_PROPERTY type)" == "nic" ]]; then
+                    EXECUTE "echo '$DEVICE' >> $NIC_DEVICES"
+                    EXECUTE "echo '$(GET_DEVICE_PROPERTY nictype)' >> $NIC_DEVICES" > /dev/null
+                    EXECUTE "echo '$(GET_DEVICE_PROPERTY parent)' >> $NIC_DEVICES" > /dev/null
+                    ADDRESS="$(GET_DEVICE_PROPERTY ipv4.address)"
+                    test "$ADDRESS" || ADDRESS="UNDEFINED"
+                    EXECUTE "echo '$ADDRESS' >> $NIC_DEVICES"
+                fi
+            done
+        fi
+        # See comments in deploy section for structure of the disk devices file:
+        for DEVICE in $DEVICES; do
+            if [[ "$(GET_DEVICE_PROPERTY type)" == "disk" ]]; then
+                SOURCE="$(GET_DEVICE_PROPERTY source)"
+                if [[ ! "$SOURCE" ]]; then
+                    continue
+                fi
+                SOURCE_REPLACED="$SOURCE"
+                EXECUTE "echo '$DEVICE' >> $DISK_DEVICES"
+                EXECUTE "echo '$(GET_DEVICE_PROPERTY path)' >> $DISK_DEVICES" > /dev/null
+                if [[ "$REPLACE" == "TRUE" ]]; then
+                    SOURCE_REPLACED="$(echo "$SOURCE" | sed -E "$REPLACE_PATTERN")"
+                fi
+                EXECUTE "echo '$SOURCE_REPLACED' >> $DISK_DEVICES" > /dev/null
+                for EXCLUDE in ${EXCLUDE_DISKS[@]}; do
+                    if echo "$DEVICE" | grep -q -- "$EXCLUDE"; then
+                        continue 2
+                    fi
+                done
+                # In debug mode just save the SOURCE path into the device's file for debug purposes:
+                if [[ "$DEBUG" == "TRUE" ]]; then
+                    EXECUTE "echo '$SOURCE' >> ${DATA_DIRECTORY}/${DEVICE}"
+                else
+                    EXECUTE "tar -czp -f ${DATA_DIRECTORY}/${DEVICE}.tar.gz -C $SOURCE ."
+                fi
+            fi
+        done
+    done
+    EXECUTE_CONTAINERS "lxc start {} > /dev/null"
+    EXECUTE "cd $DIRECTORY"
+    # "Uno-click" deploy-wrapper:
+    if [[ "$DEPLOY_SCRIPT" == "TRUE" ]]; then
+        if [[ "$FULL" == "TRUE" ]]; then
+            DEPLOY_SCRIPT_ARGUMENTS="$DEPLOY_SCRIPT_ARGUMENTS --full"
+        fi
+        EXECUTE "echo '#!/bin/sh' > $DEPLOY_SCRIPT_FILE"
+        echo 'cd "$(dirname "$0")"' >> "$DEPLOY_SCRIPT_FILE"
+        echo "./${SCRIPT_NAME} $DEPLOY_SCRIPT_ARGUMENTS \$@" >> "$DEPLOY_SCRIPT_FILE"
+        EXECUTE "chmod +x $DEPLOY_SCRIPT_FILE"
+    fi
+    # Copy itself into feature archive:
+    EXECUTE "cd $START_DIRECTORY"
+    EXECUTE "cp $0 ${DIRECTORY}/${SCRIPT_NAME}"
+    # If DESTINATION is directory, then append it with default name of the archive:
+    if echo "$DESTINATION" | grep -E '/$' > /dev/null; then
+        DESTINATION="${DESTINATION}${ARCHIVE_NAME}"
+    fi
+    # If DESTINATION ends with '.tar.gz', then archive dump, if not, then SOURCE is the temporary directory:
+    if [[ "$DESTINATION" =~ ".tar.gz"$ ]]; then
+        SOURCE="${DIRECTORY}.tar.gz"
+        EXECUTE "tar -cz -f $SOURCE -C $DIRECTORY ."
+        EXECUTE_CLEAN "rm -rf $DIRECTORY"
+    else
+        SOURCE="$DIRECTORY"
+    fi
+    # If DESTINATION contains ':', then script thinks that DESTINATION is remote and executes the scp command, if not, then just move SOURCE to their destination:
+    if echo "$DESTINATION" | grep ':' > /dev/null; then
+        EXECUTE "scp -r $SOURCE $DESTINATION"
+        EXECUTE_CLEAN "rm -rf $SOURCE"
+    else
+        if [[ "$SOURCE" != "$(realpath "$DESTINATION")" ]]; then
+            if [[ -d "$DESTINATION" ]]; then
+                EXECUTE "rm -rf $DESTINATION"
+            fi
+            EXECUTE "mv $SOURCE $DESTINATION"
+        fi
+    fi
+fi
